@@ -1,0 +1,11 @@
+# Credenciales: nunca versionar
+.env
+
+# Logs generados en cada ejecución
+/logs/
+
+# Binarios compilados
+/registrar
+/registrar.exe
+oltssh
+oltssh.exe
