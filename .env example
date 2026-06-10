@@ -1,0 +1,30 @@
+# Configuración de OLT SSH (versión Go)
+# Copia este archivo a .env y rellena los valores. NO subas el .env al repositorio.
+
+# --- Conexión SSH a la OLT ---
+OLT_HOST=192.168.2.102
+OLT_PORT=22
+OLT_USERNAME=admin
+OLT_PASSWORD=admin
+# Contraseña del modo enable; si se deja vacía, se reutiliza OLT_PASSWORD
+OLT_ENABLE_PASSWORD=
+# Timeout SSH en segundos
+OLT_TIMEOUT=30
+# Reintentos de conexión SSH y espera (segundos) entre intentos
+OLT_CONNECT_ATTEMPTS=3
+OLT_RETRY_DELAY=2
+
+# --- Conexión a la base de datos MySQL ---
+DB_HOST=192.168.253.204
+DB_PORT=3306
+DB_NAME=olt
+DB_USERNAME=emi
+DB_PASSWORD=digitalNew
+DB_CHARSET=utf8mb4
+# Reintentos de conexión a MySQL y espera (segundos) entre intentos
+DB_CONNECT_ATTEMPTS=3
+DB_RETRY_DELAY=2
+
+# --- Parámetros de la consulta ---
+QUERY_ID_OLT=1
+QUERY_PUERTO_OLT=16
