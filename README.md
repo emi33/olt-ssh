@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # OLT SSH (versión Go)
 
 Reimplementación en Go de la herramienta de registro de clientes (ONTs) en una
@@ -104,3 +105,6 @@ límite del registrador (con un mock de la conexión SSH).
 - Para OLTs antiguas se fuerzan algoritmos SSH legacy (KEX SHA1, cifrados CBC).
   Si la OLT exige host key DSA (`ssh-dss`), revisa la compatibilidad de la versión
   de `golang.org/x/crypto` (el soporte DSA se retiró en versiones recientes).
+=======
+# olt-ssh
+>>>>>>> a6b437f432daf9a8c4a739b7c17adebdeef263b1
