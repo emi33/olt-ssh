@@ -1,73 +1,88 @@
 package database
 
-// queryComandosRegistro es la consulta que GENERA los comandos de la OLT a partir
-// de las tablas onu y eqcliente. Cada fila devuelve dos cadenas:
+// rc.id se trae para poder escribir de vuelta el índice de service-port
+// asignado en la OLT (columna sp_index) sobre la fila exacta — ver
+// GuardarSPIndex.
 //
-//   - comando1: línea 'service-port ...' (asocia VLAN/servicio a la ONT)
-//   - comando2: línea 'ont add ...'      (da de alta la ONT en el puerto)
+// queryRegistrosProvisioning obtiene los registros de clientes activos en CT,
+// cruzando observacionesct con eqcliente (ultima fila por MAC), conexiones y onu.
+// Solo se traen MACs validas de clientes activos (ct.activo = 1) con fecha >= hoy
+// (CURDATE()) para la OLT indicada. El idOlt de eqcliente entra como parametro
+// posicional (?), desde PROVISIONING_ID_OLT (ver config). El cruce con onu es por
+// idOlt+puertoOlt+identificador (no por MAC). Los resultados se filtran en Go por
+// plan/estado antes de ejecutar en OLT.
+const queryRegistrosProvisioning = `
+SELECT
+    rc.id,
+    rc.mac_wan,
+    rc.pppoe AS cliente,
+    rc.ip_cliente,
+    rc.ip_controlador AS ipCT,
+    IF(rc.nro_cliente IS NULL, NULL, CAST(rc.nro_cliente AS CHAR)) AS nroConexion,
+    rc.vlan,
+    rc.ont_id AS identificador,
+    rc.puerto AS puertoOlt,
+    rc.gem_id AS gemId,
+    rc.idx AS sPort,
+    rc.plan,
+    ro.sn,
+    ro.ont_id AS onu_identificador,
+    '' AS streamProfile,
+    '' AS serviceProfile,
+    ro.estado_presencia,
+    ro.cantidad_macs,
+    rc.estado_registro
+FROM olt_test.registro_cliente rc
+JOIN olt_test.registro_onu ro
+  ON ro.id_olt = rc.id_olt
+ AND ro.puerto = rc.puerto
+ AND ro.ont_id = rc.ont_id
+WHERE rc.id_olt = ?
+  AND rc.listo_para_cargar = 1
+  AND ro.listo_para_cargar = 1
+ORDER BY rc.puerto, rc.ont_id, rc.vlan, rc.mac_wan
+`
+
+// queryCargaPrincipal es la "consulta principal" del flujo de carga a las tablas
+// de registro (registro_onu / registro_cliente). Trae los clientes ACTIVOS en los
+// CT concentradores, cruzados con la última aparición de cada MAC en eqcliente
+// (rn=1) y su ONU. Incluye eq.idx (trazabilidad del índice Kingtype).
 //
-// Diferencias respecto a la versión PHP:
-//   - Los placeholders con nombre (:idOlt, :puertoOlt) pasan a '?' posicionales,
-//     ya que go-sql-driver/mysql no soporta parámetros con nombre. El orden es
-//     (idOlt, puertoOlt).
-//   - Se elimina el 'SET @x := 3697' separado: la inicialización del contador ya
-//     ocurre de forma inline en el CROSS JOIN (SELECT @x := 3697) AS inicializador,
-//     por lo que toda la lógica vive en una única sentencia (segura frente al pool
-//     de conexiones de database/sql).
-//
-// El contador @x numera correlativamente los service-port: empieza en 3697 y el
-// primero queda en 3698 (@x := @x + 1).
-const queryComandosRegistro = `
-	SELECT
-		-- Aplicamos el contador al final, garantizando el orden correlativo puro (1, 2, 3...)
-		CONCAT(
-			'service-port ', (@x := @x + 1),
-			' config gpon 1/1/', temporal.puertoOlt,
-			' ont ', temporal.identificador,
-			' gem-id ', temporal.gem_id_calculado,
-			' svlan ', temporal.svlan_calculada,
-			' user-vlan ', temporal.svlan_calculada,
-			' tag-action transparent'
-		) AS comando1,
-		temporal.comando2
-	FROM (
-		-- Subconsulta: agrupamos, filtramos y ordenamos los datos de la ONT primero
-		SELECT
-			t1.puertoOlt,
-			t1.identificador,
-			t1.sn,
-			CASE COALESCE(t2.vlan, 666)
-				WHEN 10   THEN 1
-				WHEN 20   THEN 1
-				WHEN 21   THEN 1
-				WHEN 30   THEN 1
-				WHEN 31   THEN 1
-				WHEN 50   THEN 1
-				WHEN 62   THEN 1
-				WHEN 72   THEN 1
-				WHEN 102  THEN 3
-				WHEN 104  THEN 3
-				WHEN 572  THEN 4
-				WHEN 600  THEN 2
-				WHEN 620  THEN 2
-				WHEN 1001 THEN 2
-				WHEN 1062 THEN 2
-				ELSE 8
-			END AS gem_id_calculado,
-			COALESCE(
-				GROUP_CONCAT(DISTINCT CASE WHEN t2.vlan NOT IN (1, 2, 80) THEN t2.vlan END ORDER BY t2.vlan SEPARATOR ', '),
-				'666'
-			) AS svlan_calculada,
-			CONCAT('ont add ', t1.identificador, ' sn-auth ', CONCAT(LEFT(t1.sn, 4), '-', SUBSTRING(t1.sn, 5)), ' ont-lineprofile-id 1 ont-srvprofile-id 1') AS comando2
-		FROM olt.onu t1
-		LEFT JOIN olt.eqcliente t2
-			ON (t2.idOlt = t1.idOlt OR t2.mac = t1.mac)
-			AND t2.puertoOlt = t1.puertoOlt
-			AND t2.identificador = t1.identificador
-		WHERE t1.idOlt = ?
-		AND t1.puertoOlt = ?
-		GROUP BY t1.sn, t1.idOlt, t1.puertoOlt, t1.identificador
-		ORDER BY t1.idOlt, t1.puertoOlt, t1.identificador
-	) AS temporal
-	CROSS JOIN (SELECT @x := 3697) AS inicializador;
+// Placeholders posicionales: (idOlt del subquery, fecha de corte, ...ipCT). El
+// `%s` se reemplaza en Go por la lista de '?' de la cláusula IN (controladores
+// dinámicos desde PROVISIONING_CONTROLADORES).
+const queryCargaPrincipal = `
+SELECT
+    ct.mac              AS mac_wan,
+    ct.cliente          AS pppoe,
+    ct.ipCliente,
+    ct.ipCT             AS ipControlador,
+    ct.fecha            AS fechaCT,
+    c.nroConexion       AS nroCliente,
+    eq.vlan,
+    eq.puertoOlt        AS puertoPon,
+    eq.identificador    AS onu_id,
+    eq.idx              AS indice,
+    ct.activo           AS esActivo,
+    eq.fechaHora        AS fechaEq,
+    c.plan,
+    onu.sn,
+    onu.identificador   AS onu_identificador,
+    onu.estadoPresencia,
+    onu.cantidadmacs
+FROM observacionesct ct
+JOIN (
+    SELECT *, ROW_NUMBER() OVER (PARTITION BY mac ORDER BY fechaHora DESC) AS rn
+    FROM olt_test.eqcliente
+    WHERE idOlt = ?
+) eq ON UPPER(eq.mac) = UPPER(ct.mac) AND eq.rn = 1
+LEFT JOIN conexiones c     ON ct.cliente = c.pppoe
+LEFT JOIN olt_test.onu onu ON onu.idOlt = eq.idOlt
+                          AND onu.puertoOlt = eq.puertoOlt
+                          AND onu.identificador = eq.identificador
+                          AND onu.mac = eq.mac
+WHERE ct.mac IS NOT NULL AND ct.mac != ''
+  AND ct.fecha >= ?
+  AND ct.activo = 1
+  AND ct.ipCT IN (%s)
 `

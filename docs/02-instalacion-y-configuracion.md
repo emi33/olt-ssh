@@ -22,10 +22,10 @@ go mod download   # descarga las dependencias
 go build ./...    # compila todo el proyecto
 ```
 
-Para generar un binario llamado `registrar`:
+Para generar un binario llamado `provisionar`:
 
 ```bash
-go build -o registrar ./cmd/registrar
+go build -o provisionar ./cmd/provisionar
 ```
 
 ## Configuración
@@ -62,7 +62,7 @@ La carga y validación viven en [`config.Load()`](../internal/config/config.go).
 | `DB_CONNECT_ATTEMPTS` | `3` | No | Nº de intentos de conexión a MySQL antes de rendirse (mínimo 1). |
 | `DB_RETRY_DELAY` | `2` | No | Espera entre intentos de conexión a MySQL, en **segundos**. |
 | `QUERY_ID_OLT` | — | **Sí** | Filtra qué OLT consultar (entero). |
-| `QUERY_PUERTO_OLT` | — | **Sí** | Puerto GPON a registrar; se usa como `1/1/<n>` (entero). |
+| `QUERY_PUERTO_OLT` | — | No | Puerto GPON, forma `1/1/<n>`. Solo lo usa `cmd/consultar`. |
 
 > ℹ️ La validación reporta **todos** los problemas a la vez: si faltan varias
 > variables requeridas, el mensaje las lista juntas (`faltan variables de entorno

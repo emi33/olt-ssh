@@ -2,12 +2,13 @@
 
 Esta carpeta contiene la documentación completa de la **versión Go** del proyecto
 **OLT SSH**, una herramienta de línea de comandos que automatiza el registro de
-clientes (ONTs) en una OLT GPON: consulta una base de datos MySQL para generar
-los comandos, se conecta por SSH a la OLT y los ejecuta, dejando un log por sesión.
+clientes (ONTs) en una OLT GPON: lee las tablas `registro_onu` / `registro_cliente`
+de MySQL, arma los comandos **en Go**, se conecta por SSH a la OLT y los ejecuta,
+dejando un log por sesión.
 
-Es una **migración 1:1** de la [versión PHP](../../docs/README.md) (carpeta
-hermana), con la misma lógica de negocio. Cuando un comportamiento es idéntico al
-del PHP se indica y se enlaza al documento equivalente.
+Deriva de una [versión PHP](../../../olt-php/docs/README.md) (carpeta hermana) en la que los
+comandos se generaban dentro de una consulta SQL. Esa consulta ya no existe: el
+armado vive ahora en `cmd/provisionar`.
 
 ## Índice
 
@@ -17,20 +18,21 @@ del PHP se indica y se enlaza al documento equivalente.
 | 2 | [Instalación y configuración](02-instalacion-y-configuracion.md) | Requisitos, compilación con `go build` y variables de entorno (`.env`). |
 | 3 | [Uso y flujo de ejecución](03-uso-y-flujo.md) | Cómo ejecutar, modo `--dry-run`, confirmación, códigos de salida y resultados. |
 | 4 | [Componentes Go](04-componentes-go.md) | Descripción detallada de cada paquete (`cmd/`, `internal/*`) y sus tipos. |
-| 5 | [La consulta SQL](05-consulta-sql.md) | Explicación de la consulta que genera los comandos de la OLT. |
 | 6 | [Conexión SSH a la OLT](06-conexion-ssh.md) | Detalles de la conexión, modos (enable/config), PTY y algoritmos legacy. |
 | 7 | [Logs y solución de problemas](07-logs-y-troubleshooting.md) | Formato de los logs y errores comunes. |
-| 8 | [Mejoras](08-mejoras.md) | Reintentos de conexión (implementados) y hoja de ruta de mejoras propuestas. |
+| 8 | [Comandos de la OLT](08-comandos-olt.md) | Formato real de los comandos y respuestas de la OLT. |
+| 9 | [Estructura del proyecto](09-estructura-del-proyecto.md) | Árbol completo y qué hace cada archivo. Mapa de referencia. |
+| 10 | [Concurrencia y sistemas distribuidos](10-concurrencia-y-sistemas-distribuidos.md) | Documento de estudio: goroutines, canales, colas, microservicios y transacciones distribuidas, explicados sobre el código real del proyecto. |
 
 ## Resumen rápido
 
 ```text
-Base de datos MySQL (tabla onu + eqcliente)
+Base de datos MySQL (registro_onu + registro_cliente)
         │
-        ▼  consulta SQL -> genera comando1 (service-port) y comando2 (ont add)
-cmd/registrar  ──►  internal/registrar  ──►  internal/olt (SSH / x/crypto)
-        │                                              │
-        │                                              ▼
+        ▼  datos crudos
+cmd/provisionar  ──► arma 'ont add' y 'service-port' ──► internal/olt (SSH / x/crypto)
+        │                                                        │
+        │                                                        ▼
         └────────────► internal/logger (logs/olt_*.log) ◄── OLT GPON
 ```
 
@@ -45,15 +47,19 @@ olt-ssh-go/
 ├── docs/                         # ESTA documentación
 ├── logs/                         # Logs generados en cada ejecución
 ├── cmd/
-│   └── registrar/main.go         # Punto de entrada / CLI principal
+│   ├── provisionar/main.go       # Punto de entrada principal: arma y ejecuta comandos
+│   ├── cargar/main.go            # Llena las tablas registro_onu / registro_cliente
+│   ├── consultar/main.go         # Inspección de ONUs de un puerto (solo lectura)
+│   └── repaso/main.go            # Clasificación / repaso de registros
 └── internal/
     ├── config/                   # Carga de configuración desde env/.env
-    ├── database/                 # Conexión MySQL y consulta generadora de comandos
+    ├── database/                 # Conexión MySQL y lectura de las tablas registro_*
     ├── logger/                   # Registro de la sesión en archivo de log
-    ├── olt/                      # Conexión SSH (PTY) y envío de comandos
-    └── registrar/               # Orquesta el proceso de registro (+ tests)
+    ├── olt/                      # Conexión SSH (PTY), comandos e índices de service-port
+    └── spinner/                  # Indicador de progreso en terminal
 ```
 
-> ℹ️ **Equivalencias con el PHP:** `cmd/registrar/main.go` ↔ `registrar_clientes.php`,
-> `internal/database` ↔ `src/Database.php`, `internal/olt` ↔ `src/OltConnection.php`,
-> `internal/registrar` ↔ `src/OltClientRegistrar.php`, `internal/logger` ↔ `src/Logger.php`.
+> ℹ️ **Equivalencias con el PHP:** `internal/database` ↔ `src/Database.php`,
+> `internal/olt` ↔ `src/OltConnection.php`, `internal/logger` ↔ `src/Logger.php`.
+> `cmd/provisionar` cubre lo que en PHP hacían `registrar_clientes.php` +
+> `src/OltClientRegistrar.php` + la consulta generadora de comandos.
