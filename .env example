@@ -8,8 +8,11 @@ OLT_USERNAME=admin
 OLT_PASSWORD=admin
 # Contraseña del modo enable; si se deja vacía, se reutiliza OLT_PASSWORD
 OLT_ENABLE_PASSWORD=
-# Timeout SSH en segundos
+# Timeout SSH en segundos (prompt inicial, enable, guardado)
 OLT_TIMEOUT=30
+# Timeout de lectura por comando en segundos (default 5). Es solo el techo para
+# comandos que no responden; readUntil corta apenas reaparece el prompt.
+OLT_COMMAND_TIMEOUT=5
 # Reintentos de conexión SSH y espera (segundos) entre intentos
 OLT_CONNECT_ATTEMPTS=3
 OLT_RETRY_DELAY=2
@@ -26,5 +29,11 @@ DB_CONNECT_ATTEMPTS=3
 DB_RETRY_DELAY=2
 
 # --- Parámetros de la consulta ---
-QUERY_ID_OLT=1
-QUERY_PUERTO_OLT=16
+# idOlt de la consulta de provisioning (eqcliente en cmd/provisionar), va en
+# 'WHERE idOlt = ?' de la subconsulta de eqcliente.
+PROVISIONING_ID_OLT=2
+
+# OPCIONALES - solo para los comandos legacy 'registrar' y 'consultar' (por
+# puerto). 'provisionar' no los usa. Dejar comentados si no se usan.
+# QUERY_ID_OLT=1
+# QUERY_PUERTO_OLT=16

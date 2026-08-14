@@ -1,6 +1,8 @@
-// Package olt maneja la conexión SSH a la OLT y la ejecución de comandos sobre su
-// consola interactiva (shell con PTY). Es el equivalente de src/OltConnection.php,
-// usando golang.org/x/crypto/ssh en lugar de phpseclib3.
+// Package olt maneja la conexión a la OLT mediante sshpass + ssh externo.
+// Se usa sshpass porque la OLT 192.168.25.1 presenta una clave DSA-512 que
+// golang.org/x/crypto/ssh rechaza (tamaño inferior al mínimo de 1024 bits).
+// El comportamiento externo (Connect, EnableMode, ExecuteCommand, etc.) es
+// idéntico a la versión con la librería nativa.
 package olt
 
 import (
@@ -8,14 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"regexp"
 	"strings"
 	"time"
 
 	"oltssh/internal/config"
 	"oltssh/internal/logger"
-
-	"golang.org/x/crypto/ssh"
 )
 
 // Expresiones regulares reutilizadas (compiladas una sola vez).
@@ -32,16 +33,13 @@ var (
 	ansiRe2 = regexp.MustCompile(`\x1b\[\d+D`)
 )
 
-// Conn representa una sesión SSH interactiva con la OLT.
+// Conn representa una sesión interactiva con la OLT via sshpass.
 type Conn struct {
 	cfg    config.OLTConfig
 	logger *logger.Logger
 
-	client  *ssh.Client
-	session *ssh.Session
-	stdin   io.WriteCloser
-
-	// readCh recibe los fragmentos leídos del stdout de la sesión.
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
 	readCh chan []byte
 
 	inEnable bool
@@ -52,10 +50,8 @@ func New(cfg config.OLTConfig, log *logger.Logger) *Conn {
 	return &Conn{cfg: cfg, logger: log}
 }
 
-// Connect abre la sesión SSH con la OLT. Reintenta hasta cfg.ConnectAttempts
-// veces (esperando cfg.RetryDelay entre intentos), limpiando el estado parcial
-// entre uno y otro. Si se agotan los intentos, devuelve el mensaje del último
-// error para que el llamador lo muestre.
+// Connect abre la sesión SSH con la OLT vía sshpass. Reintenta hasta
+// cfg.ConnectAttempts veces (esperando cfg.RetryDelay entre intentos).
 func (c *Conn) Connect() error {
 	attempts := c.cfg.ConnectAttempts
 	if attempts < 1 {
@@ -71,8 +67,6 @@ func (c *Conn) Connect() error {
 			return nil
 		} else {
 			lastErr = err
-			// Cerramos lo que se hubiera abierto a medias para que el siguiente
-			// intento parta de un estado limpio.
 			c.cleanup()
 			c.log(fmt.Sprintf("Intento %d/%d de conexión a la OLT fallido: %v", intento, attempts, err))
 			if intento < attempts {
@@ -82,93 +76,86 @@ func (c *Conn) Connect() error {
 		}
 	}
 
-	return fmt.Errorf("error de conexión/autenticación SSH en la OLT tras %d intento(s): %w", attempts, lastErr)
+	return fmt.Errorf("error de conexión SSH a la OLT tras %d intento(s): %w", attempts, lastErr)
 }
 
-// cleanup cierra la sesión y el cliente SSH abiertos a medias y descarta el estado
-// para que un reintento de Connect arranque desde cero.
-func (c *Conn) cleanup() {
-	if c.session != nil {
-		c.session.Close()
-		c.session = nil
-	}
-	if c.client != nil {
-		c.client.Close()
-		c.client = nil
-	}
-	c.stdin = nil
-	// La goroutine lectora conserva su propia referencia al canal y termina sola
-	// cuando el stdout se cierra al cerrar la sesión/cliente.
-	c.readCh = nil
-}
-
-// connectOnce realiza un único intento de conexión: fuerza los algoritmos legacy
-// que usan muchas OLTs antiguas, pide un PTY, arranca el shell y consume el prompt
-// inicial.
+// connectOnce realiza un único intento de conexión usando sshpass + ssh externo.
+// Los parámetros SSH cubren todos los algoritmos legacy que requiere la OLT.
 func (c *Conn) connectOnce() error {
-	sshCfg := &ssh.ClientConfig{
-		User:            c.cfg.Username,
-		Auth:            []ssh.AuthMethod{ssh.Password(c.cfg.Password)},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // el PHP tampoco verificaba host key
-		Timeout:         c.cfg.Timeout,
-		// Algoritmos heredados equivalentes a los del setPreferredAlgorithms() del PHP.
-		Config: ssh.Config{
-			KeyExchanges: []string{"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1"},
-			Ciphers:      []string{"aes128-cbc", "aes256-cbc", "3des-cbc"},
-		},
-		HostKeyAlgorithms: []string{"ssh-rsa", "ssh-dss"},
+	timeout := int(c.cfg.Timeout.Seconds())
+	if timeout < 1 {
+		timeout = 30
 	}
 
-	addr := fmt.Sprintf("%s:%d", c.cfg.Host, c.cfg.Port)
-	client, err := ssh.Dial("tcp", addr, sshCfg)
-	if err != nil {
-		return fmt.Errorf("estableciendo conexión SSH: %w", err)
-	}
-	c.client = client
-
-	session, err := client.NewSession()
-	if err != nil {
-		client.Close()
-		return fmt.Errorf("abriendo sesión SSH: %w", err)
-	}
-	c.session = session
-
-	// Pseudo-terminal: la OLT necesita un shell interactivo.
-	modes := ssh.TerminalModes{
-		ssh.ECHO:          1,
-		ssh.TTY_OP_ISPEED: 14400,
-		ssh.TTY_OP_OSPEED: 14400,
-	}
-	if err := session.RequestPty("vt100", 80, 40, modes); err != nil {
-		return fmt.Errorf("solicitando PTY: %w", err)
+	args := []string{
+		"-p", c.cfg.Password,
+		"ssh",
+		"-tt", // fuerza PTY en el servidor (necesario para sesión interactiva)
+		"-o", "StrictHostKeyChecking=no",
+		"-o", "UserKnownHostsFile=/dev/null",
+		"-o", "KexAlgorithms=+diffie-hellman-group1-sha1",
+		"-o", "HostKeyAlgorithms=+ssh-dss",
+		"-o", "PubkeyAcceptedAlgorithms=+ssh-dss",
+		"-o", "Ciphers=+aes256-cbc,aes192-cbc,aes128-cbc",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", timeout),
+		"-p", fmt.Sprintf("%d", c.cfg.Port),
+		fmt.Sprintf("%s@%s", c.cfg.Username, c.cfg.Host),
 	}
 
-	stdin, err := session.StdinPipe()
+	c.cmd = exec.Command("sshpass", args...)
+
+	stdin, err := c.cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("abriendo stdin: %w", err)
 	}
 	c.stdin = stdin
 
-	stdout, err := session.StdoutPipe()
+	stdout, err := c.cmd.StdoutPipe()
 	if err != nil {
 		return fmt.Errorf("abriendo stdout: %w", err)
 	}
 
-	// Goroutine lectora: empuja todo lo que llega del stdout al canal readCh.
+	// stderr a un buffer para incluirlo en el mensaje de error si la conexión falla.
+	var stderrBuf bytes.Buffer
+	c.cmd.Stderr = &stderrBuf
+
 	c.startReader(stdout)
 
-	if err := session.Shell(); err != nil {
-		return fmt.Errorf("iniciando shell: %w", err)
+	if err := c.cmd.Start(); err != nil {
+		return fmt.Errorf("iniciando sshpass: %w", err)
+	}
+
+	c.log("Conectando a la OLT: " + c.cfg.Host)
+
+	// Esperar el prompt inicial de la OLT.
+	initial := c.readUntil(promptRe, c.cfg.Timeout)
+	if !promptRe.MatchString(initial) {
+		stderr := strings.TrimSpace(stderrBuf.String())
+		if stderr != "" {
+			return fmt.Errorf("conexión fallida: %s", stderr)
+		}
+		return fmt.Errorf("timeout esperando prompt inicial de la OLT (verificar credenciales y conectividad)")
 	}
 
 	c.log("Conectado a la OLT: " + c.cfg.Host)
-
-	// Consumimos el prompt inicial.
-	c.readUntil(promptRe, c.cfg.Timeout)
 	return nil
 }
 
-// startReader lanza la goroutine que lee el stdout de la sesión en fragmentos.
+// cleanup cierra stdin y mata el proceso sshpass para que un reintento parta limpio.
+func (c *Conn) cleanup() {
+	if c.stdin != nil {
+		c.stdin.Close()
+		c.stdin = nil
+	}
+	if c.cmd != nil && c.cmd.Process != nil {
+		c.cmd.Process.Kill()
+		c.cmd.Wait()
+		c.cmd = nil
+	}
+	c.readCh = nil
+}
+
+// startReader lanza la goroutine que lee el stdout de sshpass en fragmentos.
 func (c *Conn) startReader(stdout io.Reader) {
 	c.readCh = make(chan []byte, 32)
 	go func() {
@@ -188,9 +175,25 @@ func (c *Conn) startReader(stdout io.Reader) {
 	}()
 }
 
+// drain descarta de forma no bloqueante lo que haya quedado en el canal de
+// lectura (típicamente el eco/prompt ya consumido del comando anterior), para
+// que la próxima lectura no matchee salida vieja. Es seguro porque solo se
+// llama justo antes de escribir un comando nuevo: todo lo pendiente pertenece
+// al comando anterior, cuyo prompt readUntil ya consumió.
+func (c *Conn) drain() {
+	for {
+		select {
+		case _, ok := <-c.readCh:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
+}
+
 // readUntil acumula la salida hasta que el regex casa o vence el timeout.
-// Al igual que phpseclib en modo READ_REGEX, si vence el timeout devuelve lo que
-// haya leído hasta el momento (sin error), para no abortar el flujo.
 func (c *Conn) readUntil(re *regexp.Regexp, timeout time.Duration) string {
 	var buf bytes.Buffer
 	deadline := time.After(timeout)
@@ -198,7 +201,7 @@ func (c *Conn) readUntil(re *regexp.Regexp, timeout time.Duration) string {
 		select {
 		case chunk, ok := <-c.readCh:
 			if !ok {
-				return buf.String() // conexión cerrada: devolvemos lo acumulado
+				return buf.String()
 			}
 			buf.Write(chunk)
 			if re.Match(buf.Bytes()) {
@@ -222,7 +225,6 @@ func (c *Conn) EnableMode() error {
 	time.Sleep(100 * time.Millisecond)
 	resp := c.readUntil(enableRe, c.cfg.Timeout)
 
-	// Si la OLT pide contraseña de enable, la enviamos.
 	if strings.Contains(strings.ToLower(resp), "password") {
 		if _, err := c.stdin.Write([]byte(c.cfg.EnablePassword + "\r")); err != nil {
 			return fmt.Errorf("enviando contraseña de enable: %w", err)
@@ -236,10 +238,17 @@ func (c *Conn) EnableMode() error {
 	return nil
 }
 
-// ExecuteCommand envía un comando y devuelve la respuesta ya limpia de ANSI,
-// con el timeout de lectura por defecto (10s).
+// ExecuteCommand envía un comando y devuelve la respuesta ya limpia de ANSI.
+// Usa el timeout por comando configurable (OLT_COMMAND_TIMEOUT, default 5s).
+// readUntil devuelve apenas reaparece el prompt, así que este timeout solo es
+// un techo para comandos que no responden; bajarlo acelera la detección de
+// esos casos sin afectar el camino feliz.
 func (c *Conn) ExecuteCommand(command string) (string, error) {
-	return c.executeCommand(command, 10*time.Second)
+	timeout := c.cfg.CommandTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	return c.executeCommand(command, timeout)
 }
 
 // executeCommand es la implementación con timeout configurable.
@@ -248,15 +257,17 @@ func (c *Conn) executeCommand(command string, timeout time.Duration) (string, er
 		return "", errors.New("la conexión no está establecida")
 	}
 
-	// Envía el comando seguido de retorno de carro (la OLT espera \r).
+	// Descarta cualquier resto de salida del comando anterior (lo que haya
+	// quedado en el canal después del prompt ya consumido) para no arrancar la
+	// lectura con datos viejos. Reemplaza al antiguo 'sleep' fijo de 100ms por
+	// comando: readUntil ya se bloquea esperando el eco del OLT, así que el
+	// sleep solo sumaba latencia (~100ms x cada comando, ~1,7min sobre 1000+).
+	c.drain()
+
 	if _, err := c.stdin.Write([]byte(command + "\r")); err != nil {
 		return "", fmt.Errorf("escribiendo comando %q: %w", command, err)
 	}
 
-	// Pequeña pausa para que la OLT procese antes de leer.
-	time.Sleep(100 * time.Millisecond)
-
-	// Lee hasta el prompt y limpia las secuencias de escape.
 	raw := c.readUntil(promptRe, timeout)
 	clean := cleanANSI(raw)
 
@@ -270,13 +281,23 @@ func (c *Conn) executeCommand(command string, timeout time.Duration) (string, er
 	return clean, nil
 }
 
-// SaveConfig persiste la configuración en la OLT ('save'), confirmando con 'y'.
+// SaveConfig persiste la configuración en la OLT.
+//
+// Se asume que la sesión está en modo configuración global ('(config)#')
+// al momento de llamar — así terminan registrar.Run() y cmd/provisionar
+// después de la pasada de service-port — así que primero sale a modo
+// privilegiado con 'end'. 'copy running-config startup-config' (igual que
+// 'save') falla con "Error: Bad command" si se ejecuta desde '(config)#';
+// confirmado en logs/olt_20260701_142328.log:6338-6341, donde 'save' se
+// mandó sin salir de config y la OLT lo rechazó.
 func (c *Conn) SaveConfig() error {
-	// 'save' puede tardar; ampliamos el timeout a 30s.
-	if _, err := c.executeCommand("save", 30*time.Second); err != nil {
+	if _, err := c.executeCommand("end", 10*time.Second); err != nil {
+		return fmt.Errorf("saliendo a modo privilegiado: %w", err)
+	}
+
+	if _, err := c.executeCommand("copy running-config startup-config", 30*time.Second); err != nil {
 		return err
 	}
-	// Algunas OLTs piden confirmación (y/n): respondemos 'y'.
 	time.Sleep(500 * time.Millisecond)
 	if _, err := c.stdin.Write([]byte("y\r")); err != nil {
 		return fmt.Errorf("confirmando guardado: %w", err)
@@ -287,22 +308,29 @@ func (c *Conn) SaveConfig() error {
 	return nil
 }
 
-// Disconnect cierra la sesión y la conexión SSH.
+// Disconnect cierra la sesión SSH terminando el proceso sshpass.
 func (c *Conn) Disconnect() error {
-	if c.session != nil {
-		c.session.Close()
-		c.session = nil
+	if c.stdin != nil {
+		c.stdin.Close()
+		c.stdin = nil
 	}
-	if c.client != nil {
-		err := c.client.Close()
-		c.client = nil
+	if c.cmd != nil {
+		if c.cmd.Process != nil {
+			done := make(chan error, 1)
+			go func() { done <- c.cmd.Wait() }()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				c.cmd.Process.Kill()
+			}
+		}
+		c.cmd = nil
 		c.log("Desconectado de la OLT")
-		return err
 	}
 	return nil
 }
 
-// log hace eco de estado por pantalla (el log a archivo lo hace el Logger).
+// log hace eco de estado por pantalla.
 func (c *Conn) log(message string) {
 	fmt.Println(message)
 }

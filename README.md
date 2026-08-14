@@ -1,12 +1,14 @@
 # OLT SSH (versión Go)
 
-Reimplementación en Go de la herramienta de registro de clientes (ONTs) en una
-OLT GPON. Consulta MySQL para generar los comandos (`ont add` y `service-port`),
-se conecta por SSH a la OLT y los ejecuta, dejando un log por sesión.
+Herramienta en Go para registrar clientes (ONTs) en una OLT GPON. Lee las tablas
+`registro_onu` y `registro_cliente` de MySQL, **arma los comandos en Go**
+(`ont add` y `service-port`), se conecta por SSH a la OLT y los ejecuta, dejando
+un log por sesión.
 
-Es una migración 1:1 de la versión PHP (carpeta hermana), con la misma lógica de
-negocio: modo `--dry-run`, confirmación interactiva, dos pasadas
-(`ont add` → `service-port`), limpieza de ANSI y log por sesión.
+Mantiene la lógica de negocio de la versión PHP original: modo `--dry-run`,
+confirmación interactiva, limpieza de ANSI y log por sesión. La generación de
+comandos, que en PHP vivía en una consulta SQL, ahora es responsabilidad del
+programa `provisionar`.
 
 ## Documentación
 
@@ -52,41 +54,50 @@ cp .env.example .env
 | `DB_CHARSET` | `utf8mb4` | Charset |
 | `DB_CONNECT_ATTEMPTS` | `3` | Intentos de conexión a MySQL antes de rendirse |
 | `DB_RETRY_DELAY` | `2` | Espera entre intentos de conexión a MySQL (segundos) |
-| `QUERY_ID_OLT` | (requerida) | Filtra la OLT a consultar |
-| `QUERY_PUERTO_OLT` | (requerida) | Puerto GPON (forma `1/1/<n>`) |
+| `PROVISIONING_ID_OLT` | (requerida) | `id_olt` de las tablas `registro_*` a provisionar |
+| `PROVISIONING_SP_INICIO` | `3699` | Base de índice de service-port, solo si la OLT no tiene ninguno |
+| `QUERY_ID_OLT` / `QUERY_PUERTO_OLT` | — | Solo los usa `cmd/consultar` (inspección por puerto) |
 
 ## Uso
 
 ### Modo dry-run (simulación, no toca la OLT)
 
 ```bash
-go run ./cmd/registrar --dry-run
+go run ./cmd/provisionar --dry-run
 ```
 
 ### Ejecución real (pide confirmación)
 
 ```bash
-go run ./cmd/registrar
+# service-port (a partir de registro_cliente)
+go run ./cmd/provisionar
+
+# alta de ONTs con 'ont add' (a partir de registro_onu)
+go run ./cmd/provisionar --registrar-onu
 ```
 
 O con el binario compilado:
 
 ```bash
-go build -o registrar ./cmd/registrar
-./registrar --dry-run
+go build -o provisionar ./cmd/provisionar
+./provisionar --dry-run
 ```
 
 ## Estructura
 
 ```
 olt-ssh-go/
-├── cmd/registrar/main.go     # Entry point: flags, dry-run, confirmación, resumen
+├── cmd/
+│   ├── provisionar/          # Entry point principal: arma y ejecuta los comandos
+│   ├── cargar/               # Llena las tablas registro_onu / registro_cliente
+│   ├── consultar/            # Inspección de ONUs de un puerto
+│   └── repaso/               # Clasificación / repaso de registros
 └── internal/
     ├── config/               # Carga de configuración desde env/.env
     ├── logger/               # Log de sesión a archivo (logs/olt_*.log)
-    ├── database/             # Conexión MySQL + consulta generadora de comandos
-    ├── olt/                  # Conexión SSH (PTY) y ejecución de comandos
-    └── registrar/            # Orquestación (interfaz OLT) + tests
+    ├── database/             # Conexión MySQL + lectura de las tablas registro_*
+    ├── olt/                  # Conexión SSH (PTY) y asignación de índices de service-port
+    └── spinner/              # Indicador de progreso en terminal
 ```
 
 ## Tests
@@ -95,8 +106,8 @@ olt-ssh-go/
 go test ./...
 ```
 
-Los tests cubren el orden de las dos pasadas, la detección de errores y los casos
-límite del registrador (con un mock de la conexión SSH).
+Los tests cubren la asignación de índices de service-port, el parseo de
+`show service-port` y la clasificación de registros.
 
 ## Notas
 

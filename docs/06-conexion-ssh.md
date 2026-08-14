@@ -58,7 +58,8 @@ login        prompt '>'   ──en──►   enable       prompt '#'
 `EnableMode()` envía `en`; si la respuesta contiene `password`, manda
 `OLT_ENABLE_PASSWORD`. Es **idempotente** (usa el flag `inEnable`, así que llamarlo
 dos veces no hace nada la segunda). Los pasos `configure`, `interface gpon` y
-`exit` los emite el orquestador en [`registrar.Run()`](../internal/registrar/registrar.go).
+`exit` los emite [`cmd/provisionar`](../cmd/provisionar/main.go), en
+`ejecutarRegistroOnu()`.
 
 ## `ExecuteCommand()` paso a paso
 
